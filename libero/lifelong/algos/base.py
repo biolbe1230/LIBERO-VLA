@@ -142,7 +142,7 @@ class Sequential(nn.Module, metaclass=AlgoMeta):
             batch_size=self.cfg.train.batch_size,
             num_workers=self.cfg.train.num_workers,
             sampler=RandomSampler(dataset),
-            persistent_workers=True,
+            persistent_workers=True if self.cfg.train.num_workers > 0 else False,
         )
 
         prev_success_rate = -1.0
