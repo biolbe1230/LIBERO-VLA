@@ -160,13 +160,19 @@ class _QwenPlanner_Interface(nn.Module):
 
     def _extract_subtasks(self, text: str) -> List[str]:
         """
-        input Qwen output
+        input Qwen output (numbered list, possibly all on one line or multi-line)
         return list[str]
+
+        Handles two common output formats:
+          Multi-line:  "1. step one\n2. step two\n3. step three"
+          Single-line: "1. step one 2. step two 3. step three"
         """
-        pattern = r"\d+\.\s*(.+)"
-        tasks = re.findall(pattern, text)
-        # remove empty lines and empty space
-        tasks = [t.strip() for t in tasks if len(t.strip()) > 0]
+        # Non-greedy match; lookahead stops at the next "N." item or end-of-string.
+        # re.DOTALL lets "." cross newlines so multi-line blocks are captured too.
+        pattern = r"\d+\.\s*(.*?)(?=\s*\d+\.|$)"
+        tasks = re.findall(pattern, text, re.DOTALL)
+        # strip whitespace / newlines and drop empty entries
+        tasks = [t.strip() for t in tasks if t.strip()]
         return tasks
     
     def _prepare_image(self, img: Union[np.ndarray, Image.Image, str]) -> Union[Image.Image, str]:
