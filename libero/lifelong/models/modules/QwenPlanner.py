@@ -24,22 +24,58 @@ from transformers import (
 logger = logging.getLogger(__name__)
 
 
+# -----------------------------------------------------------------------
+# System prompts – v1 (strict 7-verb list) and v2 (flexible verbs)
+# -----------------------------------------------------------------------
+
 default_system_prompt_plan = (
     "You are an expert household manipulation planner for a robot system. "
     "You will receive two images for every decision: "
-    "(1) a main camera image showing the overall scene, table, objects, and the robotic arm from a human-like viewpoint, "
-    "and (2) a wrist camera image showing a close-up, top-down view of the gripper and nearby objects. "
+    "(1) a main camera image showing the overall scene and the robotic arm, "
+    "and (2) a wrist camera image showing a close-up view. "
+
+    "Your job is to convert a high-level task into a sequence of concise, atomic, spatial sub-tasks. "
+    "Each sub-task must strictly follow the format: '<Action Verb> <Target Object> <Target Location/State>'. "
     
-    "Your job is to convert a high-level task into a sequence of concise, atomic sub-tasks that a vision-language-action model can execute. "
-    "Each sub-task must describe exactly one physical action and must be observable and feasible for a robot arm in a real environment. "
     "RULES: "
-    "1. Use both the input images and the high-level task to decide the needed actions. "
-    "2. Break down the task into small, sequential, physical steps. "
-    "3. Never combine two actions into one. One step equals one action. "
-    "4. Do not assume the robot is already holding any object. "
-    "5. Use only simple, physical verbs such as: move to the object or location; pick up the object; place the object on, in, or next to a target; open the container; close the container; turn on or turn off an appliance. "
-    "6. Keep each step short, concrete, and unambiguous. "
-    "7. Do not output explanations. Only output the sub-task list. "
+    "1. Limit the sequence to 2-4 steps maximum. Only the most essential milestones. "
+    "2. Use ONLY these verbs: Move to, Pick up, Place, Open, Close, Turn on, Turn off. "
+    "3. Explicitly state the target object and the target spatial location. "
+    "4. Do not assume the robot is holding anything initially. "
+    "5. Format strictness: Each step must be a single imperative sentence. "
+    "   Example: 'Pick up the red mug from the table.' "
+    "   Example: 'Place the mug on the top shelf.' "
+    "6. Do not output explanations. "
+
+    "OUTPUT FORMAT: SUBTASK LIST: 1. ... 2. ... 3. ..."
+)
+
+# v2: open verb vocabulary – supports Grasp, Push, Slide, Pull, Insert, etc.
+default_system_prompt_plan_v2 = (
+    "You are an expert household manipulation planner for a robot system. "
+    "You will receive two images for every decision: "
+    "(1) a main camera image showing the overall scene and the robotic arm, "
+    "and (2) a wrist camera image showing a close-up view. "
+
+    "Your job is to convert a high-level task into a sequence of concise, "
+    "atomic sub-tasks that a robotic arm can execute one by one. "
+    "Each sub-task must be a single imperative sentence with a clear action verb, "
+    "a target object, and a destination or target state. "
+
+    "RULES: "
+    "1. Limit the sequence to 2-4 steps maximum. Only the most essential milestones. "
+    "2. Start each step with a clear, specific action verb "
+    "   (e.g. Pick up, Place, Move to, Open, Close, Push, Pull, Slide, "
+    "   Grasp, Release, Turn on, Turn off, Insert, Align, Lift, Lower, Rotate). "
+    "   Choose the most precise verb that describes the motion. "
+    "3. Explicitly state the target object and the target spatial location or state. "
+    "4. Do not assume the robot is holding anything initially. "
+    "5. Each step must be a single imperative sentence. "
+    "   Example: 'Pick up the red mug from the table.' "
+    "   Example: 'Slide the plate to the left side of the counter.' "
+    "   Example: 'Push the drawer closed.' "
+    "6. Do not output explanations. "
+
     "OUTPUT FORMAT: SUBTASK LIST: 1. ... 2. ... 3. ..."
 )
 
@@ -111,10 +147,15 @@ class _QwenPlanner_Interface(nn.Module):
         dtype: Union[str, torch.dtype] = torch.bfloat16,
         device_map: str = "auto",
         attn_implementation: Optional[str] = None,
+        prompt_version: str = "v1",
         **kwargs,
     ):
         """
         loading Qwen model and processor
+
+        Args:
+            prompt_version: "v1" uses the strict 7-verb prompt (backward compat),
+                            "v2" uses the flexible open-vocabulary prompt.
         """
         super().__init__()
 
@@ -155,6 +196,10 @@ class _QwenPlanner_Interface(nn.Module):
         self.device = torch.device(device)
         self.config = config
 
+        # Select planning prompt version
+        if prompt_version == "v2":
+            system_prompt_plan = default_system_prompt_plan_v2
+            logger.info("Using v2 planner prompt (open verb vocabulary)")
         self.system_prompt_plan = system_prompt_plan
         self.system_prompt_check = system_prompt_check
 
@@ -213,6 +258,48 @@ class _QwenPlanner_Interface(nn.Module):
             return_tensors="pt",
         )
         return model_inputs.to(self.model.device)
+
+    def _get_visual_token_ids(self) -> List[int]:
+        """Best-effort retrieval of visual token ids used in multimodal sequence."""
+        ids: List[int] = []
+
+        # Prefer model config ids if available (most reliable).
+        for key in ("image_token_id", "video_token_id", "vision_token_id"):
+            v = getattr(self.model.config, key, None)
+            if v is not None:
+                try:
+                    ids.append(int(v))
+                except Exception:
+                    pass
+
+        if ids:
+            return sorted(set(ids))
+
+        # Fallback: try known token strings from tokenizer vocab.
+        tok = self.processor.tokenizer
+        unk_id = getattr(tok, "unk_token_id", None)
+        for token_str in (
+            "<|image_pad|>",
+            "<|video_pad|>",
+            "<|vision_start|>",
+            "<|vision_end|>",
+            "<image>",
+        ):
+            try:
+                tid = tok.convert_tokens_to_ids(token_str)
+            except Exception:
+                tid = None
+            if tid is None:
+                continue
+            try:
+                tid = int(tid)
+            except Exception:
+                continue
+            if unk_id is not None and tid == int(unk_id):
+                continue
+            ids.append(tid)
+
+        return sorted(set(ids))
 
     @torch.inference_mode()
     def _generate_text(
@@ -353,6 +440,75 @@ class _QwenPlanner_Interface(nn.Module):
         if return_text:
             return completed, output_text
         return completed
+
+    @torch.inference_mode()
+    def encode_env_state(
+        self,
+        image_list: Sequence[Union[np.ndarray, Image.Image, str]],
+        prompt: str = "Observe the current environment state.",
+        max_length: int = 512,
+    ) -> np.ndarray:
+        """
+        Encode multi-view environment observation into one vector `s_env`
+        using PURE visual-token pooling.
+
+        Returns:
+            np.ndarray with shape [hidden_size], dtype float32
+        """
+        _ = prompt  # keep API compatibility; pure-vision path ignores text prompt.
+        messages = [
+            {
+                "role": "system",
+                "content": "",
+            },
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": ""}],
+            },
+        ]
+        for img in image_list:
+            prepared_img = self._prepare_image(img)
+            messages[1]["content"].append({"type": "image", "image": prepared_img})
+
+        model_inputs = self._build_inputs(messages)
+
+        # Optional safety trim for very long contexts.
+        if "input_ids" in model_inputs and model_inputs["input_ids"].shape[1] > max_length:
+            model_inputs["input_ids"] = model_inputs["input_ids"][:, -max_length:]
+            if "attention_mask" in model_inputs:
+                model_inputs["attention_mask"] = model_inputs["attention_mask"][:, -max_length:]
+
+        outputs = self.model(
+            **model_inputs,
+            output_hidden_states=True,
+            use_cache=False,
+            return_dict=True,
+        )
+        hidden = outputs.hidden_states[-1]  # [1, T, D]
+
+        input_ids = model_inputs.get("input_ids", None)
+        visual_token_ids = self._get_visual_token_ids()
+        visual_mask = None
+        if input_ids is not None and len(visual_token_ids) > 0:
+            visual_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+            for vid in visual_token_ids:
+                visual_mask |= (input_ids == vid)
+            if "attention_mask" in model_inputs:
+                visual_mask &= model_inputs["attention_mask"].bool()
+
+        # Pure visual pooling. If detection fails, fallback to valid-token pooling.
+        if visual_mask is not None and bool(visual_mask.any().item()):
+            mask = visual_mask.unsqueeze(-1).to(hidden.dtype)
+            pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+        elif "attention_mask" in model_inputs:
+            logger.warning("No visual token mask found; fallback to attention-mask pooling.")
+            mask = model_inputs["attention_mask"].unsqueeze(-1).to(hidden.dtype)
+            pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+        else:
+            logger.warning("No visual token mask and no attention mask; fallback to mean pooling.")
+            pooled = hidden.mean(dim=1)
+
+        return pooled[0].detach().float().cpu().numpy()
 
 
 

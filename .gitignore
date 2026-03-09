@@ -18,4 +18,5 @@ libero.egg-info/
 .vscode/
 
 libero/datasets/
-skill_lib_results/*
+skill_lib_results*/
+tmp/
