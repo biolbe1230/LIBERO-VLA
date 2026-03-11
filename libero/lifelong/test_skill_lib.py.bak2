@@ -56,11 +56,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import nltk
-from nltk import word_tokenize, pos_tag
-from nltk.stem import WordNetLemmatizer
-from nltk.corpus import verbnet as nltk_verbnet
-
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
@@ -1244,146 +1239,117 @@ def oat_hierarchical_cluster(
     return int_labels, cluster_info
 
 
-
 # -----------------------------------------------------------------------
-# VerbNet-style two-level hierarchy (real NLTK VerbNet lookup)
+# VerbNet-style two-level hierarchy
 # -----------------------------------------------------------------------
 
-_WNL = WordNetLemmatizer()
-
-# Domain-specific disambiguation: for verbs that map to many VerbNet classes,
-# choose the most task-relevant class for robotic manipulation.
-_VN_CLASS_PREFERENCE: dict[str, str] = {
-    "pick":  "get-13.5.1",
-    "place": "put-9.1-2",
-    "put":   "put-9.1-2",
-    "open":  "other_cos-45.4",
-    "close": "other_cos-45.4",
-    "move":  "roll-51.3.1",
-    "turn":  "turn-26.6.1-1",
-    "pull":  "push-12-1",
-    "push":  "push-12-1-1",
-    "grasp": "hold-15.1-1",
-    "grab":  "obtain-13.5.2",
-    "lift":  "put_direction-9.4",
-    "reach": "reach-51.8",
-    "set":   "put-9.1-2",
+# Offline VerbNet mapping (no external corpus download required).
+# Level-1 skill = VerbNet class id.
+_VERBNET_VERB_CLASS_MAP: dict[str, tuple[str, str]] = {
+    "move to": ("move", "motion-51.3.2"),
+    "go to": ("go", "motion-51.3.2"),
+    "reach": ("reach", "motion-51.3.2"),
+    "pick up": ("pick", "obtain-13.5.2"),
+    "grasp": ("grasp", "obtain-13.5.2"),
+    "grab": ("grab", "obtain-13.5.2"),
+    "lift": ("lift", "obtain-13.5.2"),
+    "place": ("place", "put-9.1"),
+    "put": ("put", "put-9.1"),
+    "set down": ("set", "put-9.1"),
+    "open": ("open", "open-45.8"),
+    "close": ("close", "close-45.4"),
+    "shut": ("shut", "close-45.4"),
+    "pull": ("pull", "pull-12"),
+    "turn on": ("turn", "entity_specific_cos-45.5"),
+    "turn off": ("turn", "entity_specific_cos-45.5"),
+    "turn": ("turn", "turn-26.6.1"),
 }
 
-_STOP_ARTICLES_VN = {"the", "a", "an", "this", "that", "its"}
-_PREPOSITIONS_VN = {
+_VERBNET_SORTED_VERBS = sorted(
+    _VERBNET_VERB_CLASS_MAP.keys(), key=len, reverse=True
+)
+
+_STOP_ARTICLES = {"the", "a", "an", "this", "that", "its"}
+_PREPOSITIONS = {
     "to", "on", "in", "at", "from", "into", "onto", "of", "under",
     "below", "behind", "above", "inside", "outside", "with", "for",
     "off", "over", "between", "near",
 }
 
-# Known verb patterns: phrasal verbs + common single-word verbs.
-# Matched greedily (longest first) before falling back to POS tagging.
-_KNOWN_VERB_MAP = {
-    "pick up": "pick",
-    "move to": "move",
-    "go to":   "go",
-    "turn on": "turn",
-    "turn off": "turn",
-    "set down": "set",
-    "place":   "place",
-    "put":     "put",
-    "open":    "open",
-    "close":   "close",
-    "pull":    "pull",
-    "push":    "push",
-    "grasp":   "grasp",
-    "grab":    "grab",
-    "lift":    "lift",
-    "reach":   "reach",
-    "shut":    "shut",
-}
-_KNOWN_VERB_SORTED = sorted(_KNOWN_VERB_MAP.keys(), key=len, reverse=True)
+
+def _split_tokens(text: str) -> list[str]:
+    cleaned = text.strip().rstrip(".").lower()
+    return [tok for tok in cleaned.replace("'", " ").split() if tok]
 
 
-def _resolve_vn_class(lemma: str) -> str:
-    """Look up the VerbNet class for a verb lemma using NLTK VerbNet.
+def _extract_verb_phrase_vn(text: str) -> str:
+    lower = text.strip().rstrip(".").lower()
+    for v in _VERBNET_SORTED_VERBS:
+        if lower.startswith(v):
+            return v
 
-    If the verb maps to multiple classes, use domain preference;
-    otherwise take the first class returned. Falls back to 'unknown-0'.
-    """
-    classes = nltk_verbnet.classids(lemma=lemma)
-    if not classes:
-        return "unknown-0"
-    if lemma in _VN_CLASS_PREFERENCE:
-        pref = _VN_CLASS_PREFERENCE[lemma]
-        if pref in classes:
-            return pref
-    # Return first class as default
-    return classes[0]
+    tokens = _split_tokens(text)
+    if not tokens:
+        return ""
 
-
-def _parse_subtask_verbnet(text: str) -> dict[str, str]:
-    """Parse a subtask description using NLTK tokenisation + VerbNet.
-
-    Returns dict with keys:
-        verb_phrase, verb_lemma, verbnet_class, object_phrase, head_noun, level2_key
-    """
-    cleaned = text.strip().rstrip(".")
-    lower = cleaned.lower()
-
-    # 1. Try phrasal verbs first
-    verb_phrase = ""
-    verb_lemma = ""
-    for pv in _KNOWN_VERB_SORTED:
-        if lower.startswith(pv):
-            verb_phrase = pv
-            verb_lemma = _KNOWN_VERB_MAP[pv]
+    verb_tokens = []
+    for tok in tokens:
+        if tok in _STOP_ARTICLES:
             break
+        verb_tokens.append(tok)
+    return " ".join(verb_tokens) if verb_tokens else tokens[0]
 
-    if not verb_phrase:
-        # Use NLTK tokenise + POS tag to find the verb
-        tokens = word_tokenize(cleaned)
-        tagged = pos_tag(tokens)
-        for word, tag in tagged:
-            if tag.startswith("VB"):
-                verb_phrase = word.lower()
-                verb_lemma = _WNL.lemmatize(word.lower(), "v")
-                break
-        if not verb_lemma:
-            # Fallback: treat first token as verb
-            first = tokens[0].lower() if tokens else "unknown"
-            verb_phrase = first
-            verb_lemma = _WNL.lemmatize(first, "v")
 
-    # 2. VerbNet class lookup
-    vn_class = _resolve_vn_class(verb_lemma)
-
-    # 3. Extract object phrase (everything after verb phrase, minus articles/preps)
+def _extract_object_phrase_vn(text: str, verb_phrase: str) -> str:
+    lower = text.strip().rstrip(".").lower()
     rest = lower
     if verb_phrase and lower.startswith(verb_phrase):
         rest = lower[len(verb_phrase):].strip()
 
-    rest_tokens = rest.split()
-    # Strip leading articles
-    while rest_tokens and rest_tokens[0] in _STOP_ARTICLES_VN:
+    rest_tokens = _split_tokens(rest)
+    while rest_tokens and rest_tokens[0] in _STOP_ARTICLES:
         rest_tokens = rest_tokens[1:]
 
-    # Collect noun phrase tokens until a preposition
-    obj_tokens: list[str] = []
+    if not rest_tokens:
+        return ""
+
+    phrase = []
     for tok in rest_tokens:
-        if tok in _PREPOSITIONS_VN and obj_tokens:
+        if tok in _PREPOSITIONS and phrase:
             break
-        if tok not in _STOP_ARTICLES_VN:
-            obj_tokens.append(tok)
+        if tok not in _STOP_ARTICLES:
+            phrase.append(tok)
+    return " ".join(phrase).strip()
 
-    obj_phrase = " ".join(obj_tokens).strip()
-    head_noun = obj_tokens[-1] if obj_tokens else "none"
 
-    level2_key = f"{verb_phrase or 'unknown'}+{head_noun}"
+def _head_noun(phrase: str) -> str:
+    tokens = _split_tokens(phrase)
+    return tokens[-1] if tokens else "none"
+
+
+def parse_verbnet_skill(text: str) -> dict[str, str]:
+    """Parse subtask into VerbNet-oriented hierarchy fields.
+
+    Level-1: verbnet_class
+    Level-2: verb + head_noun
+    """
+    verb_phrase = _extract_verb_phrase_vn(text)
+    obj_phrase = _extract_object_phrase_vn(text, verb_phrase)
+    noun = _head_noun(obj_phrase)
+
+    if verb_phrase in _VERBNET_VERB_CLASS_MAP:
+        verb_lemma, vn_class = _VERBNET_VERB_CLASS_MAP[verb_phrase]
+    else:
+        verb_lemma = verb_phrase.split()[0] if verb_phrase else "unknown"
+        vn_class = "other-unknown"
 
     return {
         "verb_phrase": verb_phrase or "unknown",
         "verb_lemma": verb_lemma,
         "verbnet_class": vn_class,
         "object_phrase": obj_phrase,
-        "head_noun": head_noun,
-        "level2_key": level2_key,
+        "head_noun": noun,
+        "level2_key": f"{verb_phrase or 'unknown'}+{noun}",
     }
 
 
@@ -1401,15 +1367,15 @@ def verbnet_hierarchical_cluster(
     output_dir: Path,
     task_languages: list[str],
 ):
-    """Two-level hierarchy using real NLTK VerbNet:
+    """Two-level hierarchy:
 
-    Level 1: VerbNet class (linguistic verb category from VerbNet corpus)
-    Level 2: concrete verb_phrase + head_noun combination
+    Level 1: VerbNet class (linguistic action type)
+    Level 2: concrete verb+noun combination
     """
     del dist_threshold
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    parses = [_parse_subtask_verbnet(t) for t in subtask_texts]
+    parses = [parse_verbnet_skill(t) for t in subtask_texts]
 
     global_labels: list[str] = []
     level1_groups: dict[str, list[int]] = {}
@@ -1436,14 +1402,13 @@ def verbnet_hierarchical_cluster(
         center_texts[cid] = subtask_texts[rep_idx]
 
     print(
-        f"\n[VerbNet] Hierarchy built (NLTK VerbNet): "
+        f"\n[VerbNet] Hierarchy built: "
         f"{len(level1_groups)} level-1 classes, {n_clusters} level-2 clusters"
     )
     for c in sorted(level1_groups.keys()):
         uniq_l2 = len({global_labels[i] for i in level1_groups[c]})
-        print(f"  {c:30s} -> {len(level1_groups[c]):3d} subtasks, {uniq_l2:2d} l2")
+        print(f"  {c:24s} -> {len(level1_groups[c]):3d} subtasks, {uniq_l2:2d} l2")
 
-    # ---- t-SNE visualisation ----
     norm_emb = normalize(embeddings)
     perplexity = _safe_perplexity(len(subtask_texts))
     tsne = TSNE(n_components=2, perplexity=perplexity, random_state=42, max_iter=1000)
@@ -1468,7 +1433,7 @@ def verbnet_hierarchical_cluster(
         ax.annotate(
             f"{p['verbnet_class']}: {short}",
             xy=(cx, cy), xytext=(6, 4), textcoords="offset points",
-            fontsize=11, color="black",
+            fontsize=5.5, color="black",
             bbox=dict(boxstyle="round,pad=0.2", fc="white", ec=class_color, alpha=0.85, linewidth=0.8),
             zorder=6,
         )
@@ -1484,25 +1449,22 @@ def verbnet_hierarchical_cluster(
         handles=legend_handles,
         bbox_to_anchor=(1.01, 1),
         loc="upper left",
-        fontsize=12,
+        fontsize=6.0,
         title=f"VerbNet L1 classes ({len(classes)})",
-        title_fontsize=14,
+        title_fontsize=7,
     )
     ax.set_title(
         "VerbNet Hierarchical Skill Library - LIBERO-90\n"
-        "Level-1: VerbNet class (NLTK)   Level-2: Verb + Noun",
-        fontsize=16,
+        "Level-1: VerbNet class   Level-2: Verb + Noun"
     )
-    ax.set_xlabel("t-SNE dim 1", fontsize=14)
-    ax.set_ylabel("t-SNE dim 2", fontsize=14)
-    ax.tick_params(labelsize=12)
+    ax.set_xlabel("t-SNE dim 1")
+    ax.set_ylabel("t-SNE dim 2")
     plt.tight_layout()
     scatter_path = output_dir / "skill_clusters_tsne.png"
     fig.savefig(scatter_path, dpi=150)
     plt.close(fig)
     print(f"[VerbNet] Scatter plot saved -> {scatter_path}")
 
-    # ---- text summary ----
     summary_lines = []
     print(f"\n[VerbNet] {n_clusters} level-2 clusters:")
     for level1 in classes:
@@ -1541,7 +1503,6 @@ def verbnet_hierarchical_cluster(
     summary_path.write_text("\n".join(summary_lines), encoding="utf-8")
     print(f"[VerbNet] Text summary saved -> {summary_path}")
 
-    # ---- detailed records ----
     records = []
     for i, (text, tid, gl) in enumerate(zip(subtask_texts, task_ids, global_labels)):
         cid = cluster_id_map[gl]
@@ -1569,7 +1530,6 @@ def verbnet_hierarchical_cluster(
     )
     print(f"[VerbNet] Detailed records saved -> {json_path}")
 
-    # ---- per-task assignment ----
     task_cluster_map: dict[int, dict] = {}
     for i, (text, tid, gl) in enumerate(zip(subtask_texts, task_ids, global_labels)):
         cid = cluster_id_map[gl]
@@ -1597,7 +1557,6 @@ def verbnet_hierarchical_cluster(
     )
     print(f"[VerbNet] Per-task assignments saved -> {task_json_path}")
 
-    # ---- cluster representatives ----
     rep_map = {}
     for gl, cid in sorted(cluster_id_map.items(), key=lambda x: x[1]):
         p = parses[center_indices[cid]]
@@ -1616,7 +1575,6 @@ def verbnet_hierarchical_cluster(
     print(f"[VerbNet] Representatives saved -> {rep_path}")
 
     return int_labels, level2_groups
-
 
 
 def parse_obs_structure(obs: dict[str, Any]) -> dict[str, Any]:
